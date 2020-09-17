@@ -1,13 +1,11 @@
 
 const net = require('net');
 const carrier = require('carrier');
-const crypto = require('crypto');
 const got = require('got');
-const HttpAgent = require('agentkeepalive');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const GET_WORK_INTERVAL = 1000;
-const WORKERS = 1024;
-const PORT = 4444;
+const PORT = 8666;
 
 const humanHashrate = (hashes) => {
     const thresh = 1000;
@@ -20,11 +18,31 @@ const humanHashrate = (hashes) => {
     return `${hashes.toFixed(hashes >= 100 ? 0 : hashes >= 10 ? 1 : 2)} ${units[u]}`;
 };
 
-const getPoolClient = (poolName, workerName, walletAddress, numberOfWorkers) => {
+const getPoolClient = async (poolName, walletAddress) => {
 
-    const client = got.extend({
+    const apiClient = got.extend({
         agent: {
-            http: new HttpAgent()
+            https: new SocksProxyAgent({
+                host: 'localhost',
+                port: 9150
+            })
+        },
+        headers: {
+            'accept': '*/*',
+            'charsets': 'utf-8',
+            'content-Type': 'application/json',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; rv:80.0) Gecko/20100101 Firefox/80.0'
+        },
+        responseType: 'json',
+        timeout: 2000
+    });
+
+    const poolClient = got.extend({
+        agent: {
+            https: new SocksProxyAgent({
+                host: 'localhost',
+                port: 9150
+            })
         },
         decompress: false,
         headers: {
@@ -38,11 +56,26 @@ const getPoolClient = (poolName, workerName, walletAddress, numberOfWorkers) => 
         timeout: 2000
     });
 
-    const getWorkerId = () => Math.floor(numberOfWorkers * Math.random()) + 1;
+    const getWorkers = async () => {
+        try {
+            const { body } = await apiClient.get(`http://${poolName}.mibpool.com:8080/api/accounts/${walletAddress}`);
+            return Object.entries(body.workers).filter(e => !e[1].offline).map(e => e[0]);
+        }
+        catch (e) {
+            console.error(`http://${poolName}.mibpool.com:8080/api/accounts/${walletAddress}`, e.message);
+            throw e;
+        }
+    };
+
+    const workers = await getWorkers();
+    const workerName = workers[Math.floor(Math.random() * workers.length)];
+
+
+    console.log(`Selected worker: ${workerName}`);
 
     return {
         getWork: async () => {
-            const { body } = await client.post(`${walletAddress}/${workerName}_Worker${getWorkerId()}`, {
+            const { body } = await poolClient.post(`${walletAddress}/${workerName}`, {
                 json: {
                     id: 1,
                     jsonrpc: '2.0',
@@ -52,11 +85,12 @@ const getPoolClient = (poolName, workerName, walletAddress, numberOfWorkers) => 
             if (body.error) {
                 throw body.error;
             }
-            return body.result;
+            const [header, seed, target] = body.result;
+            return [header, seed, target];
         },
 
         submitWork: async (nonce, header, mix) => {
-            const { body } = await client.post(`${walletAddress}/${workerName}_Worker${getWorkerId()}`, {
+            const { body } = await poolClient.post(`${walletAddress}/${workerName}`, {
                 json: {
                     id: 1,
                     jsonrpc: '2.0',
@@ -106,24 +140,12 @@ const server = net.createServer(conn => {
         }
     };
 
-    const onSubmitLogin = (msg) => {
-        const [walletAddress, extra] = msg.params;
-        const x = extra.split('.');
-        if (x.length !== 3) {
-            send(msg.id, null, { code: -1, message: 'Wrong arguments' });
-            return;
-        }
-        const [poolName, workerName, difficulty] = x;
+    const onSubmitLogin = async (msg) => {
+        const [walletAddress, poolName] = msg.params;
 
-        // Some random number of workers
-        const hash = crypto.createHash('sha256');
-        hash.update(poolName + workerName + walletAddress);
-        const workers = WORKERS / (16 ** difficulty);
-        const numberOfWorkers = workers + (hash.digest().readUInt32LE(0) % workers) + Math.floor(100 * Math.random()) + 1;
+        client = await getPoolClient(poolName, walletAddress);
 
-        client = getPoolClient(poolName, workerName, walletAddress, numberOfWorkers);
-
-        console.log(`Login: ${poolName} / ${workerName} / ${walletAddress}, workers: ${numberOfWorkers}`);
+        console.log(`Login: ${poolName} / ${walletAddress}`);
         send(msg.id, true);
     };
 
@@ -135,7 +157,6 @@ const server = net.createServer(conn => {
         getAndSendWork((header, seed, target) => {
             if (header !== lastHeader) {
                 lastHeader = header;
-                target = '0x' + target.substring(2, target.length - difficulty).padStart(64, '0');
                 send(0, [header, seed, target]);
             }
         });
